@@ -107,6 +107,7 @@ addtest(
   LIBS parameter psi device
   SOURCES run_md_test.cpp
           ../run_md.cpp
+          ../module_plumed/plumed_atoms.cpp
           ../module_plumed/plumed_interface.cpp
           ../md_base.cpp
           ../fire.cpp
@@ -118,6 +119,10 @@ addtest(
           ../../source_cell/magnetism.cpp
           ${md_run_json_sources}
           ${depend_files})
+
+addtest(
+  TARGET MODULE_MD_plumed_atoms
+  SOURCES test_plumed_atoms.cpp ../module_plumed/plumed_atoms.cpp)
 
 addtest(
   TARGET MODULE_MD_fire
