@@ -527,6 +527,7 @@ OBJS_MD=fire.o\
     md_func.o\
     msst.o\
     nhchain.o\
+    plumed_atoms.o\
     plumed_interface.o\
     run_md.o\
     verlet.o\

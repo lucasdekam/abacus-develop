@@ -22,12 +22,10 @@
 #include "verlet.h"
 #include "source_cell/update_cell.h"
 #include "source_cell/print_cell.h"
+#include "source_md/module_plumed/plumed_atoms.h"
 #include "source_md/module_plumed/plumed_interface.h"
 
 #include <vector>
-#ifdef __MPI
-#include <mpi.h>
-#endif
 
 namespace Run_MD
 {
@@ -83,40 +81,6 @@ void prepare_mdcell(MDCell& mdcell, UnitCell& ucell, DomainDecomposition& decomp
 
 namespace
 {
-/// @brief collect the absolute Cartesian positions (in Bohr) of the atoms
-/// owned by this rank; the cell stores cart in units of the lattice constant
-void collect_plumed_positions(const MDCell& mdcell, std::vector<ModuleBase::Vector3<double>>& positions)
-{
-    const double lat0 = mdcell.lat0();
-    const std::vector<LocalAtom>& atoms = mdcell.owned_atoms();
-    positions.resize(atoms.size());
-    for (std::size_t i = 0; i < atoms.size(); ++i)
-    {
-        positions[i] = atoms[i].cart * lat0;
-    }
-}
-
-/// @brief gather the atomic forces (in Hartree/Bohr)
-void collect_plumed_forces(const MDCell& mdcell, std::vector<ModuleBase::Vector3<double>>& forces)
-{
-    const std::vector<LocalAtom>& atoms = mdcell.owned_atoms();
-    forces.resize(atoms.size());
-    for (std::size_t i = 0; i < atoms.size(); ++i)
-    {
-        forces[i] = atoms[i].force;
-    }
-}
-
-/// @brief write the (PLUMED-biased) forces back into the cell
-void apply_plumed_forces(MDCell& mdcell, const std::vector<ModuleBase::Vector3<double>>& forces)
-{
-    std::vector<LocalAtom>& atoms = mdcell.owned_atoms();
-    for (std::size_t i = 0; i < atoms.size(); ++i)
-    {
-        atoms[i].force = forces[i];
-    }
-}
-
 /// @brief 3x3 cell matrix (in Bohr, row-major) expected by PLUMED
 void collect_plumed_cell(const MDCell& mdcell, double* cell)
 {
@@ -171,21 +135,23 @@ void md_line(MDCell& mdcell,
     /// interface to PLUMED: no-op unless `plumed` is set in INPUT and ABACUS
     /// was compiled with PLUMED support (-DPLUMED_ROOT=...)
     ModulePlumed::PlumedInterface plumed;
-    std::vector<ModuleBase::Vector3<double>> plumed_positions;
-    std::vector<ModuleBase::Vector3<double>> plumed_forces;
+    ModulePlumed::OwnedAtoms plumed_atoms;
     double plumed_cell[9];
 
     auto run_plumed_step = [&](const int istep) {
-        collect_plumed_positions(mdcell, plumed_positions);
-        collect_plumed_forces(mdcell, plumed_forces);
+        /// each rank hands over the atoms it owns
+        ModulePlumed::collect_owned_atoms(mdcell.owned_atoms(),
+                                          mdcell.lat0(),
+                                          mdcell.type_atom_counts(),
+                                          plumed_atoms);
         collect_plumed_cell(mdcell, plumed_cell);
-        plumed.move(istep,
-                    plumed_positions.data(),
-                    plumed_forces.data(),
-                    plumed_cell,
-                    mdrun->potential,
-                    param_in.inp.cal_stress ? mdrun->virial.c : nullptr);
-        apply_plumed_forces(mdcell, plumed_forces);
+        const double* virial = nullptr;
+        if (param_in.inp.cal_stress)
+        {
+            virial = mdrun->virial.c;
+        }
+        plumed.move(istep, plumed_atoms, plumed_cell, mdrun->potential, virial);
+        ModulePlumed::apply_owned_forces(plumed_atoms, mdcell.owned_atoms());
     };
 
     /// md cycle, mohan update 2026-01-04, change '<=' to '<'
@@ -206,25 +172,20 @@ void md_line(MDCell& mdcell,
 
             if (param_in.mdp.plumed)
             {
-                int nproc = 1;
+                /// the atoms are distributed over the ranks of the MD
+                /// communicator; PLUMED is given it only when there is more
+                /// than one rank
+                const void* plumed_comm = nullptr;
 #ifdef __MPI
-                MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+                MPI_Comm md_comm = mdcell.communicator();
+                if (mdcell.mpi_size() > 1)
+                {
+                    plumed_comm = &md_comm;
+                }
 #endif
-                if (nproc > 1)
-                {
-                    ModuleBase::WARNING_QUIT("md_line",
-                                             "the PLUMED interface currently supports a single MPI rank only; "
-                                             "run the MD with one process (OpenMP threads are fine)");
-                }
-                std::vector<double> plumed_masses(mdcell.owned_atoms().size());
-                for (std::size_t i = 0; i < mdcell.owned_atoms().size(); ++i)
-                {
-                    plumed_masses[i] = mdcell.owned_atoms()[i].mass;
-                }
-                plumed.init(param_in.mdp.plumed_file,
-                            static_cast<int>(mdcell.owned_atoms().size()),
-                            mdrun->get_md_dt(),
-                            plumed_masses.data());
+                const int plumed_nat = static_cast<int>(mdcell.nat());
+                const double plumed_dt = mdrun->get_md_dt();
+                plumed.init(param_in.mdp.plumed_file, plumed_nat, plumed_dt, plumed_comm);
                 /// the initial configuration already carries positions and
                 /// forces, so PLUMED can be called right away
                 run_plumed_step(mdrun->step_ + mdrun->step_rst_);

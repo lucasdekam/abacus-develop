@@ -1,5 +1,7 @@
 #include "plumed_interface.h"
 
+#include "plumed_atoms.h"
+
 #include <cmath>
 
 #include "source_base/tool_quit.h"
@@ -39,19 +41,11 @@ PlumedInterface::~PlumedInterface()
 bool PlumedInterface::init(const std::string& plumed_file,
                            const int nat,
                            const double dt_au,
-                           const double* masses_au)
+                           const void* mpi_comm)
 {
 #ifdef USE_PLUMED
     this->active_run_ = true;
     this->nat_ = nat;
-
-    // ABACUS stores atomic masses in atomic units (electron masses), while
-    // PLUMED expects them in amu
-    this->masses_amu_.resize(nat);
-    for (int i = 0; i < nat; ++i)
-    {
-        this->masses_amu_[i] = masses_au[i] * ELECTRON_MASS_TO_AMU;
-    }
 
     this->plumed_ = plumed_create();
     this->has_plumed_ = true;
@@ -71,6 +65,14 @@ bool PlumedInterface::init(const std::string& plumed_file,
 
     // commands that configure PLUMED must be issued before "init"
     plumed_cmd(this->plumed_, "setRealPrecision", &real_precision);
+    // atoms distributed over several ranks: PLUMED runs in its
+    // domain-decomposition mode (setAtomsNlocal / setAtomsGatindex every
+    // step).  Not handed over for a single rank, so that a PLUMED built
+    // without MPI still works there.
+    if (mpi_comm != nullptr)
+    {
+        plumed_cmd(this->plumed_, "setMPIComm", mpi_comm);
+    }
     plumed_cmd(this->plumed_, "setMDLengthUnits", &length_units);
     plumed_cmd(this->plumed_, "setMDEnergyUnits", &energy_units);
     plumed_cmd(this->plumed_, "setMDTimeUnits", &time_units);
@@ -85,7 +87,7 @@ bool PlumedInterface::init(const std::string& plumed_file,
     (void)plumed_file;
     (void)nat;
     (void)dt_au;
-    (void)masses_au;
+    (void)mpi_comm;
 
     ModuleBase::WARNING_QUIT("ModulePlumed::PlumedInterface::init",
                              "plumed was requested in INPUT but ABACUS was not compiled with PLUMED support; "
@@ -123,29 +125,57 @@ void PlumedInterface::prepare_virial_(const double* cell, const double* virial)
 }
 
 void PlumedInterface::compute_forces_(const int istep,
-                                      const ModuleBase::Vector3<double>* pos,
-                                      double* force,
+                                      OwnedAtoms& owned,
                                       const double* cell,
                                       const double potential,
                                       const double* virial)
 {
 #ifdef USE_PLUMED
     int step = istep;
+    int nlocal = static_cast<int>(owned.gatindex.size());
     double energy = potential;
 
+    // ABACUS stores atomic masses in atomic units (electron masses), while
+    // PLUMED expects them in amu; the owned atoms change between steps, so
+    // the masses are converted every step
+    this->masses_amu_.resize(nlocal);
+    for (int i = 0; i < nlocal; ++i)
+    {
+        this->masses_amu_[i] = owned.masses[i] * ELECTRON_MASS_TO_AMU;
+    }
+
+    // a rank may own no atoms; PLUMED is handed valid (unused) buffers then
+    int no_index = 0;
+    double no_vector[3] = {0.0, 0.0, 0.0};
+    double no_mass = 0.0;
+    const int* gatindex = &no_index;
+    double* positions = no_vector;
+    double* forces = no_vector;
+    double* masses = &no_mass;
+    if (nlocal > 0)
+    {
+        // Vector3<double> is a plain {double x, y, z} structure, so the
+        // arrays can be handed to PLUMED as contiguous [nlocal][3] buffers
+        gatindex = owned.gatindex.data();
+        positions = reinterpret_cast<double*>(owned.positions.data());
+        forces = reinterpret_cast<double*>(owned.forces.data());
+        masses = this->masses_amu_.data();
+    }
+
     plumed_cmd(this->plumed_, "setStep", &step);
-    // Vector3<double> is a plain {double x, y, z} structure, so the arrays can
-    // be handed to PLUMED as contiguous [nat][3] buffers
-    plumed_cmd(this->plumed_, "setPositions",
-               reinterpret_cast<double*>(const_cast<ModuleBase::Vector3<double>*>(pos)));
-    plumed_cmd(this->plumed_, "setMasses", this->masses_amu_.data());
+    // the atoms owned by this rank and their global 0-based indices; with a
+    // single rank owning all atoms the indices are the identity
+    plumed_cmd(this->plumed_, "setAtomsNlocal", &nlocal);
+    plumed_cmd(this->plumed_, "setAtomsGatindex", gatindex);
+    plumed_cmd(this->plumed_, "setPositions", positions);
+    plumed_cmd(this->plumed_, "setMasses", masses);
     plumed_cmd(this->plumed_, "setBox", cell);
     plumed_cmd(this->plumed_, "setEnergy", &energy);
     // prepare the calculation graph; the arrays that receive the biasing
     // forces are registered afterwards, as done in the reference
     // implementations distributed with PLUMED
     plumed_cmd(this->plumed_, "prepareCalc", nullptr);
-    plumed_cmd(this->plumed_, "setForces", force);
+    plumed_cmd(this->plumed_, "setForces", forces);
     this->prepare_virial_(cell, virial);
     plumed_cmd(this->plumed_, "setVirial", this->virial_buf_);
     // flag this step as a checkpointing step: PLUMED then flushes all its
@@ -157,8 +187,7 @@ void PlumedInterface::compute_forces_(const int istep,
     plumed_cmd(this->plumed_, "performCalc", nullptr);
 #else
     (void)istep;
-    (void)pos;
-    (void)force;
+    (void)owned;
     (void)cell;
     (void)potential;
     (void)virial;
@@ -166,8 +195,7 @@ void PlumedInterface::compute_forces_(const int istep,
 }
 
 void PlumedInterface::move(const int istep,
-                           const ModuleBase::Vector3<double>* pos,
-                           ModuleBase::Vector3<double>* force,
+                           OwnedAtoms& owned,
                            const double* cell,
                            const double potential,
                            const double* virial)
@@ -177,11 +205,10 @@ void PlumedInterface::move(const int istep,
     {
         return;
     }
-    this->compute_forces_(istep, pos, reinterpret_cast<double*>(force), cell, potential, virial);
+    this->compute_forces_(istep, owned, cell, potential, virial);
 #else
     (void)istep;
-    (void)pos;
-    (void)force;
+    (void)owned;
     (void)cell;
     (void)potential;
     (void)virial;

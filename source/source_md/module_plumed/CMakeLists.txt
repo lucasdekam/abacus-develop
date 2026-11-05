@@ -1,6 +1,7 @@
 add_library(
     module_plumed
     OBJECT
+    plumed_atoms.cpp
     plumed_interface.cpp
 )
 

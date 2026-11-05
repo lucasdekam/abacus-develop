@@ -762,8 +762,8 @@ Note: It is a system-dependent empirical parameter. An improper choice might lea
                            "variables, biasing potentials and free-energy methods during an MD run. "
                            "ABACUS must be compiled with -DENABLE_PLUMED=ON and linked against a "
                            "PLUMED installation (discovered through pkg-config or PLUMED_ROOT) to "
-                           "enable this feature. The PLUMED interface currently supports a single "
-                           "MPI rank only.";
+                           "enable this feature. With several MPI ranks, PLUMED must be built with "
+                           "MPI.";
         item.default_value = "False";
         item.unit = "";
         read_sync_bool(input.mdp.plumed);

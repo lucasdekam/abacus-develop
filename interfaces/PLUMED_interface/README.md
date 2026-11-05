@@ -41,10 +41,12 @@ ABACUS hands the atomic positions (Bohr), masses (amu), cell, potential energy
 and virial over to PLUMED after every MD step, and PLUMED adds the biasing
 forces in place.
 
-Note: the interface currently supports a single MPI rank only, because PLUMED
-must see the whole system while ABACUS distributes the atoms of an MD run over
-the ranks. OpenMP threads inside that single rank are fine, e.g.
-`OMP_NUM_THREADS=32 abacus > log`.
+The MD can run on several MPI ranks, e.g. `mpirun -np 4 abacus > log`. ABACUS
+distributes the atoms of an MD run over the ranks, so PLUMED then runs in its
+domain-decomposition mode: each rank hands over only the atoms it owns,
+together with their global indices, and PLUMED gathers the atoms its actions
+need. PLUMED must be built with MPI for this; a PLUMED built without MPI works
+for single-rank runs (OpenMP threads inside that rank are fine).
 
 ## Example
 
